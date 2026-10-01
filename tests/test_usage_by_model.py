@@ -117,23 +117,26 @@ def final_event(text: str = "交接") -> dict:
 class UsageByModelTests(unittest.TestCase):
     def test_usage_row_exposes_token_totals_credit_components_and_effective_ratio(self) -> None:
         row = usage_by_model.usage_row(
-            "gpt-6-sol",
+            "gpt-6.1-sol",
             {"events": 1, "input": 100, "cached": 40, "output": 10, "reasoning": 7},
         )
 
         self.assertEqual(row["total_processed_tokens"], 110)
         self.assertEqual(row["uncached_input_tokens"], 60)
         self.assertEqual(row["reasoning_output_tokens"], 7)
-        self.assertAlmostEqual(row["estimated_standard_credits"], 0.0057)
+        self.assertAlmostEqual(row["estimated_standard_credits"], 0.0056)
         self.assertEqual(
             row["estimated_standard_credit_breakdown"],
-            {"uncached_input": 0.003, "cached_input": 0.0002, "output": 0.0025},
+            {"uncached_input": 0.003, "cached_input": 0.0001, "output": 0.0025},
         )
-        self.assertAlmostEqual(row["effective_processed_tokens_per_credit"], 110 / 0.0057)
+        self.assertAlmostEqual(row["effective_processed_tokens_per_credit"], 110 / 0.0056)
 
     def test_rate_card_exposes_type_specific_token_equivalents(self) -> None:
         cards = {row["model"]: row for row in usage_by_model.rate_card_rows()}
 
+        self.assertEqual(cards["gpt-6.1-sol"]["tokens_per_credit"]["uncached_input"], 20_000)
+        self.assertEqual(cards["gpt-6.1-sol"]["tokens_per_credit"]["cached_input"], 400_000)
+        self.assertEqual(cards["gpt-6.1-sol"]["tokens_per_credit"]["output"], 4_000)
         self.assertEqual(cards["gpt-6-sol"]["tokens_per_credit"]["uncached_input"], 20_000)
         self.assertEqual(cards["gpt-6-sol"]["tokens_per_credit"]["cached_input"], 200_000)
         self.assertEqual(cards["gpt-6-sol"]["tokens_per_credit"]["output"], 4_000)

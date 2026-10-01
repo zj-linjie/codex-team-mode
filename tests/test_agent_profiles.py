@@ -8,7 +8,7 @@ ROOT = Path(__file__).parents[1]
 PROFILES = {
     "Explorer.toml": ("Explorer", "gpt-6-luna", "medium", "read-only"),
     "Executor.toml": ("Executor", "gpt-6-luna", "xhigh", "workspace-write"),
-    "Reviewer.toml": ("Reviewer", "gpt-6-sol", "high", "workspace-write"),
+    "Reviewer.toml": ("Reviewer", "gpt-6.1-sol", "high", "workspace-write"),
     "default.toml": ("default", "gpt-6-luna", "low", "read-only"),
 }
 

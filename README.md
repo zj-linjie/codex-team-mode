@@ -12,7 +12,7 @@ Team Mode 是 Codex Skill。主 Agent 负责拆解、未决判断和最终验收
 | --- | --- | --- |
 | Explorer | GPT-6 Luna Medium、Fast | 主 Agent 明确需要探索大量代码，先定位主要文件、入口和调用关系。 |
 | Executor | GPT-6 Luna Extra High | 目标和文件归属清楚时，围绕预期结果完成实现。 |
-| Reviewer | GPT-6 Sol High | 从全新上下文独立检查稳定产物；需要留档时保存 Markdown 审查报告。 |
+| Reviewer | GPT-6.1 Sol High | 从全新上下文独立检查稳定产物；需要留档时保存 Markdown 审查报告。 |
 | ExpertAdvisor | 模型按次选择 | 为复杂决策制定方案，或在主 Agent 难以胜任时执行建模与复杂计算机自动化；也可处理反复未解决的问题。 |
 
 Explorer 默认请求 Fast；其他角色沿用主 Agent 的速度档。GPT-6 Fast 可用时，额度消耗为 Standard 的 2.5 倍，实际生效档位以子 Agent 运行记录为准。

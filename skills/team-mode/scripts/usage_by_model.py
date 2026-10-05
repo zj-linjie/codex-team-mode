@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Summarize locally retained Codex token usage by model, task, and Agent."""
+"""Summarize locally retained Codex token usage and output speed by model, task, and Agent."""
 
 from __future__ import annotations
 
@@ -29,6 +29,11 @@ RATES = {
 
 USAGE_FIELDS = ("input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens")
 TRACE_DATE_RE = re.compile(r"(?:^|[-_])(20\d{2})[-_](\d{2})[-_](\d{2})(?:T|[-_.]|$)")
+TOOL_CALL_ITEM_TYPES = ("custom_tool_call", "function_call")
+TOOL_OUTPUT_ITEM_TYPES = ("custom_tool_call_output", "function_call_output")
+# 窗口短于下限时线程开销主导，长于上限时大概率横跨了空闲或断点续跑。
+MIN_SPEED_WINDOW_SECONDS = 0.2
+MAX_SPEED_WINDOW_SECONDS = 120.0
 
 
 def default_sessions_root() -> Path:
@@ -51,6 +56,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
     parser.add_argument("--by-agent", action="store_true", help="Also group usage by custom Agent role.")
     parser.add_argument("--by-session", action="store_true", help="Also show each root or subagent session separately.")
+    parser.add_argument(
+        "--speed", action="store_true",
+        help="Also report per-response output speed (median/mean/p10/p90 tokens per second).",
+    )
     parser.add_argument(
         "--sessions-root", type=Path, default=None,
         help="Override the sessions directory; an archive is added only when explicitly requested.",
@@ -369,6 +378,56 @@ def merge_usage(target: dict[str, int], source: dict[str, int]) -> None:
         target[key] += source[key]
 
 
+def speed_stats(samples: list[float]) -> dict[str, Any] | None:
+    """把每条响应的平均输出速度样本汇总成分布统计。"""
+    if not samples:
+        return None
+    ordered = sorted(samples)
+    count = len(ordered)
+
+    def percentile(fraction: float) -> float:
+        index = fraction * (count - 1)
+        low = int(index)
+        high = min(low + 1, count - 1)
+        return ordered[low] + (ordered[high] - ordered[low]) * (index - low)
+
+    return {
+        "samples": count,
+        "median_tokens_per_sec": percentile(0.5),
+        "mean_tokens_per_sec": sum(ordered) / count,
+        "p10_tokens_per_sec": percentile(0.1),
+        "p90_tokens_per_sec": percentile(0.9),
+    }
+
+
+def tool_seconds_in_window(
+    start: datetime, end: datetime, spans: list[tuple[datetime, datetime]]
+) -> float:
+    """统计与 [start, end] 重叠的工具执行时长，用于从速度窗口中扣除。"""
+    total = 0.0
+    for span_start, span_end in spans:
+        overlap_start = max(span_start, start)
+        overlap_end = min(span_end, end)
+        if overlap_end > overlap_start:
+            total += (overlap_end - overlap_start).total_seconds()
+    return total
+
+
+def pool_speed_samples(
+    sessions: list[dict[str, Any]],
+) -> tuple[dict[str, list[float]], dict[str, list[float]]]:
+    """把会话级速度样本按模型与按 Agent 角色 · 模型重新归池。"""
+    by_model: dict[str, list[float]] = defaultdict(list)
+    by_agent: dict[str, list[float]] = defaultdict(list)
+    for session in sessions:
+        samples = session.get("speed_samples")
+        if not samples:
+            continue
+        by_model[session["model"]].extend(samples)
+        by_agent[f"{session['agent_role']} · {session['model']}"].extend(samples)
+    return by_model, by_agent
+
+
 def scan(
     root: Path,
     cutoff: date | None,
@@ -411,6 +470,10 @@ def scan(
         last_turn_final_report_present = False
         last_terminal: str | None = None
         skipped_duplicates = 0
+        speed_samples_by_segment: dict[tuple[str, str | None], list[float]] = defaultdict(list)
+        last_response: tuple[datetime, tuple[str, str | None]] | None = None
+        pending_tool_calls: dict[str, datetime] = {}
+        tool_spans: list[tuple[datetime, datetime]] = []
         try:
             lines = path.open("r", encoding="utf-8")
         except OSError:
@@ -436,6 +499,8 @@ def scan(
                     next_effort = payload.get("effort")
                     if (next_model, next_effort) != (model, effort):
                         previous_snapshots.clear()
+                        # 模型段切换后，上一段的响应时间与当前段不再连续。
+                        last_response = None
                     model = next_model
                     effort = next_effort
                     sandbox = payload.get("sandbox_policy")
@@ -456,9 +521,25 @@ def scan(
                         last_turn_final_report_present = False
                         last_terminal = None
                         # 新一轮可能重发上一轮累计快照；task_started本身不是计数重置。
+                        # 速度窗口同样不跨轮：轮间空闲属于用户而非模型。
+                        last_response = None
                     elif event_kind == "turn_aborted":
                         interrupted_count += 1
                         last_terminal = "interrupted"
+                elif event.get("type") == "response_item":
+                    item_type = payload.get("type")
+                    if item_type in TOOL_CALL_ITEM_TYPES:
+                        call_id = payload.get("call_id")
+                        if isinstance(call_id, str) and timestamp:
+                            pending_tool_calls[call_id] = timestamp
+                    elif item_type in TOOL_OUTPUT_ITEM_TYPES:
+                        call_id = payload.get("call_id")
+                        called_at = (
+                            pending_tool_calls.pop(call_id, None)
+                            if isinstance(call_id, str) else None
+                        )
+                        if called_at and timestamp:
+                            tool_spans.append((min(called_at, timestamp), max(called_at, timestamp)))
                 if is_nonempty_assistant_final(event):
                     final_report_present = True
                     last_turn_final_report_present = True
@@ -485,6 +566,26 @@ def scan(
                             continue
                         previous_snapshots[segment] = snapshot if snapshot_key else None
                         add_usage(usage_by_segment[segment], usage)
+                        # 速度口径：本次响应的输出 tokens ÷ 与上一条响应之间的窗口，
+                        # 窗口扣除工具执行时长；仍包含排队与 prefill，且输出含 reasoning。
+                        if timestamp and last_response is not None:
+                            previous_at, previous_segment = last_response
+                            if previous_segment == segment:
+                                window = (timestamp - previous_at).total_seconds()
+                                output = int(usage.get("output_tokens") or 0)
+                                if (
+                                    MIN_SPEED_WINDOW_SECONDS < window <= MAX_SPEED_WINDOW_SECONDS
+                                    and output > 0
+                                ):
+                                    generating = window - tool_seconds_in_window(
+                                        previous_at, timestamp, tool_spans
+                                    )
+                                    if generating > 0:
+                                        speed_samples_by_segment[segment].append(
+                                            output / generating
+                                        )
+                        if timestamp:
+                            last_response = (timestamp, segment)
         role = trace["agent_role"]
         started = min(timestamps) if timestamps else None
         ended = max(timestamps) if timestamps else None
@@ -517,6 +618,7 @@ def scan(
                 "task_complete": task_complete,
                 "interrupted_count": interrupted_count,
                 "skipped_duplicate_events": skipped_duplicates,
+                "speed_samples": speed_samples_by_segment.get((session_model, session_effort), []),
                 "effective_sandbox": sorted(sandboxes),
                 "approval_policy": sorted(approvals),
             })
@@ -640,6 +742,7 @@ def session_rows(sessions: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "last_turn_final_report_present": session.get("last_turn_final_report_present", False),
             "interrupted_count": session.get("interrupted_count", 0),
             "skipped_duplicate_events": session.get("skipped_duplicate_events", 0),
+            "speed": speed_stats(session.get("speed_samples") or []),
             "effective_sandbox": session.get("effective_sandbox", []),
             "approval_policy": session.get("approval_policy", []),
             "depth": session.get("depth", 0),
@@ -712,6 +815,33 @@ def print_session_table(data: list[dict[str, Any]]) -> None:
     print()
 
 
+def speed_cells(speed: dict[str, Any] | None) -> tuple[str, str, str, str, str]:
+    if not speed:
+        return ("0", "n/a", "n/a", "n/a", "n/a")
+    return (
+        str(speed["samples"]),
+        f"{speed['median_tokens_per_sec']:.1f}",
+        f"{speed['mean_tokens_per_sec']:.1f}",
+        f"{speed['p10_tokens_per_sec']:.1f}",
+        f"{speed['p90_tokens_per_sec']:.1f}",
+    )
+
+
+def print_speed_table(
+    title: str, data: list[dict[str, Any]], label_for=None
+) -> None:
+    label_for = label_for or (lambda row: row["name"])
+    print(f"{title} (tokens/sec · response-level average)")
+    print(
+        f"{'Row':<36} {'Samples':>8} {'Median':>9} {'Mean':>9} {'P10':>9} {'P90':>9}"
+    )
+    print("-" * 84)
+    for row in data:
+        samples, median, mean, low, high = speed_cells(row.get("speed"))
+        print(f"{label_for(row):<36} {samples:>8} {median:>9} {mean:>9} {low:>9} {high:>9}")
+    print()
+
+
 def print_rate_card() -> None:
     print("Standard rate card · credits per 1M tokens / tokens per credit")
     print(
@@ -766,6 +896,11 @@ def main() -> int:
         return 2
     model_rows = rows(by_model)
     agent_rows = rows(by_agent) if args.by_agent else []
+    model_speed_samples, agent_speed_samples = pool_speed_samples(sessions)
+    for row in model_rows:
+        row["speed"] = speed_stats(model_speed_samples.get(row["name"], []))
+    for row in agent_rows:
+        row["speed"] = speed_stats(agent_speed_samples.get(row["name"], []))
     all_session_details = session_rows(sessions)
     detailed_sessions = all_session_details if args.by_session else []
     if resolved_task_id:
@@ -778,6 +913,7 @@ def main() -> int:
         "Credits use configured Standard rates and do not detect mixed Fast usage.",
         "Account limits and resets remain authoritative in Codex /usage.",
         "Runtime fields come from local trace events; completed means only that the session has task_complete, not that artifact quality is assured.",
+        "Speed metrics are response-level averages: last_token_usage output (reasoning included) divided by the window since the previous token_count minus observed tool execution; traces carry no token deltas, so TTFT and inter-token latency are unavailable.",
     ]
     distinct_session_rows = unique_session_rows(all_session_details)
     status_rows = diagnostics.get("session_statuses") or distinct_session_rows
@@ -828,6 +964,16 @@ def main() -> int:
         print_table("By Agent role", agent_rows)
     if args.by_session:
         print_session_table(detailed_sessions)
+    if args.speed:
+        print_speed_table("Output speed by model", model_rows)
+        if args.by_agent:
+            print_speed_table("Output speed by Agent role", agent_rows)
+        if args.by_session:
+            print_speed_table(
+                "Output speed by session",
+                detailed_sessions,
+                label_for=lambda row: f"{str(row['session_id'])[:8]} · {row['name']}",
+            )
     print_rate_card()
     print(f"Rate source: {RATE_SOURCE}")
     print("* Tok/Credit is the observed processed-token ratio for that row, not a universal conversion. ")

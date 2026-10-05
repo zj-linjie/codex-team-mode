@@ -9,7 +9,7 @@ Read this only when the user asks to evaluate routing, model choice, cost, or pr
 3. Judge the returned artifact and the parent's inspection or rework, not the child's self-assessment.
 4. Compare comparable work only. Do not create duplicate work just to fill a benchmark.
 
-For local usage, run `python3 scripts/usage_by_model.py --task-id current --by-agent --by-session --json`. Separate uncached input, cached input, output, reasoning output, and estimated Standard credits. Local traces can omit sessions, and credit estimates are not invoices.
+For local usage, run `python3 scripts/usage_by_model.py --task-id current --by-agent --by-session --json`. Separate uncached input, cached input, output, reasoning output, and estimated Standard credits. `--speed` adds per-response output speed (median/mean/p10/p90 tokens per second): output tokens, reasoning included, divided by the window since the previous response minus observed tool execution; it is a response-level average, not streaming tokens per second. Local traces can omit sessions, and credit estimates are not invoices.
 
 Record whether the fresh brief supplied the goal, source paths, scope, and checks the child needed. Missing evidence is a briefing issue before it is a model issue. Distinguish a completed lifecycle event from an actual final report and from main-agent acceptance. Inspect shared artifacts before retrying a failed or interrupted child.
 

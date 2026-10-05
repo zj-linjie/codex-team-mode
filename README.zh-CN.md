@@ -44,7 +44,7 @@ Skill 和角色配置分开安装。将 [`agents/`](./agents) 中的 `Explorer.t
 
 ## 诊断
 
-`current_model.py` 按需从本地任务日志读取主 Agent 实际模型；`usage_by_model.py` 统计本地保留会话的模型和用量。日志可能不完整，费用按注明日期的 Standard 费率估算，不能当作账单。
+`current_model.py` 按需从本地任务日志读取主 Agent 实际模型；`usage_by_model.py` 统计本地保留会话的模型和用量，`--speed` 可按模型/会话报告响应级平均输出速度（含 reasoning，非流式瞬时速度）。日志可能不完整，费用按注明日期的 Standard 费率估算，不能当作账单。
 
 ```bash
 python3 skills/team-mode/scripts/current_model.py

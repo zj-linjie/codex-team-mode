@@ -46,4 +46,4 @@ A model fixed in a custom profile takes precedence over a spawn-time choice. See
 
 ## Diagnostics
 
-For a requested usage report, run `python3 scripts/usage_by_model.py`; read [evaluation guidance](references/evaluation.md) when evaluating Team Mode itself. For an interactive-state task that code inspection cannot establish, read [interactive testing guidance](references/interactive-testing.md).
+For a requested usage report, run `python3 scripts/usage_by_model.py` (`--speed` adds response-level output speed per model and session); read [evaluation guidance](references/evaluation.md) when evaluating Team Mode itself. For an interactive-state task that code inspection cannot establish, read [interactive testing guidance](references/interactive-testing.md).

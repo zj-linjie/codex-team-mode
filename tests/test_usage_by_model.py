@@ -525,6 +525,100 @@ class UsageByModelTests(unittest.TestCase):
             finally:
                 time.tzset()
 
+    def test_speed_uses_response_window_minus_observed_tool_time(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            base = {"input_tokens": 10, "cached_input_tokens": 0, "output_tokens": 100}
+            write_events(root, "speed.jsonl", [
+                {"type": "session_meta", "payload": {"id": "speed", "session_id": "speed"}},
+                {"type": "turn_context", "payload": {"model": "gpt-6.1-sol", "effort": "high"}},
+                {"timestamp": "2026-07-17T00:00:01Z", **token_event(base)},
+                {"timestamp": "2026-07-17T00:00:02Z", "type": "response_item",
+                 "payload": {"type": "custom_tool_call", "call_id": "a"}},
+                {"timestamp": "2026-07-17T00:00:04Z", "type": "response_item",
+                 "payload": {"type": "custom_tool_call_output", "call_id": "a"}},
+                {"timestamp": "2026-07-17T00:00:06Z", **token_event({**base, "output_tokens": 90})},
+                {"timestamp": "2026-07-17T00:00:06.500Z", "type": "response_item",
+                 "payload": {"type": "function_call", "call_id": "b"}},
+                {"timestamp": "2026-07-17T00:00:07.500Z", "type": "response_item",
+                 "payload": {"type": "function_call_output", "call_id": "b"}},
+                {"timestamp": "2026-07-17T00:00:08Z", **token_event({**base, "output_tokens": 60})},
+            ])
+            _, _, sessions, *_ = usage_by_model.scan(root, None, "speed")
+            speed = usage_by_model.session_rows(sessions)[0]["speed"]
+
+            # 窗口 5s 扣除 2s 工具 → 90/3=30；窗口 2s 扣除 1s 工具 → 60/1=60
+            self.assertEqual(speed["samples"], 2)
+            self.assertAlmostEqual(speed["median_tokens_per_sec"], 45.0)
+            self.assertAlmostEqual(speed["mean_tokens_per_sec"], 45.0)
+            self.assertAlmostEqual(speed["p10_tokens_per_sec"], 33.0)
+            self.assertAlmostEqual(speed["p90_tokens_per_sec"], 57.0)
+
+    def test_speed_skips_zero_output_short_windows_turn_resets_and_idle_gaps(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            last = {"input_tokens": 10, "cached_input_tokens": 0, "output_tokens": 50}
+            write_events(root, "speed-gaps.jsonl", [
+                {"type": "session_meta", "payload": {"id": "gaps", "session_id": "gaps"}},
+                {"type": "turn_context", "payload": {"model": "gpt-6.1-sol", "effort": "high"}},
+                {"timestamp": "2026-07-17T00:00:01Z", **token_event(last)},
+                {"timestamp": "2026-07-17T00:00:02Z", **token_event({**last, "output_tokens": 0})},
+                {"timestamp": "2026-07-17T00:00:02.100Z", **token_event(last)},
+                {"type": "event_msg", "payload": {"type": "task_started"}},
+                {"timestamp": "2026-07-17T00:00:04Z", **token_event(last)},
+                {"timestamp": "2026-07-17T00:00:06Z", **token_event({**last, "output_tokens": 100})},
+                {"timestamp": "2026-07-17T00:08:00Z", **token_event({"input_tokens": 10, "output_tokens": 1000})},
+            ])
+            _, _, sessions, *_ = usage_by_model.scan(root, None, "gaps")
+            speed = usage_by_model.session_rows(sessions)[0]["speed"]
+
+            # 仅 04→06 的 2s 窗口有效：100/2=50；零输出、0.1s 窗口、
+            # task_started 重置、以及 124s 空闲窗口都产生不了样本
+            self.assertEqual(speed["samples"], 1)
+            self.assertAlmostEqual(speed["median_tokens_per_sec"], 50.0)
+
+    def test_speed_window_resets_when_model_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            last = {"input_tokens": 10, "cached_input_tokens": 0, "output_tokens": 50}
+            write_events(root, "speed-models.jsonl", [
+                {"type": "session_meta", "payload": {"id": "models", "session_id": "models"}},
+                {"type": "turn_context", "payload": {"model": "gpt-5.6-luna", "effort": "medium"}},
+                {"timestamp": "2026-07-17T00:00:01Z", **token_event(last)},
+                {"type": "turn_context", "payload": {"model": "gpt-5.6-terra", "effort": "medium"}},
+                {"timestamp": "2026-07-17T00:00:03Z", **token_event(last)},
+                {"timestamp": "2026-07-17T00:00:05Z", **token_event(last)},
+            ])
+            _, _, sessions, *_ = usage_by_model.scan(root, None, "models")
+            details = usage_by_model.session_rows(sessions)
+
+            by_model = {row["model"]: row["speed"] for row in details}
+            self.assertIsNone(by_model["gpt-5.6-luna"])
+            self.assertEqual(by_model["gpt-5.6-terra"]["samples"], 1)
+            self.assertAlmostEqual(by_model["gpt-5.6-terra"]["median_tokens_per_sec"], 25.0)
+
+    def test_cli_json_rows_carry_speed_stats(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            codex_home = Path(directory) / ".codex"
+            last = {"input_tokens": 10, "cached_input_tokens": 0, "output_tokens": 40}
+            write_events(codex_home / "sessions", "speed-cli.jsonl", [
+                {"type": "session_meta", "payload": {"id": "cli-speed", "session_id": "cli-speed"}},
+                {"type": "turn_context", "payload": {"model": "gpt-5.6-luna", "effort": "medium"}},
+                {"timestamp": "2026-07-17T00:00:01Z", **token_event(last)},
+                {"timestamp": "2026-07-17T00:00:03Z", **token_event(last)},
+            ])
+            env = os.environ.copy()
+            env["CODEX_HOME"] = str(codex_home)
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), "--all", "--json", "--speed", "--by-session"],
+                check=True, capture_output=True, text=True, env=env,
+            )
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["models"][0]["speed"]["samples"], 1)
+            self.assertAlmostEqual(payload["models"][0]["speed"]["median_tokens_per_sec"], 20.0)
+            self.assertEqual(payload["sessions"][0]["speed"]["samples"], 1)
+            self.assertTrue(any("Speed metrics" in line for line in payload["limitations"]))
+
     def test_cli_explicit_sessions_root_does_not_implicitly_read_archive(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
